@@ -8,6 +8,6 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$DIR/venv/bin/activate"
 
 # Run the vision system with any passed arguments
-python "$DIR/vectorlines_heatmap.py" "$@"
+python "$DIR/optical_flow.py" "$@"
 
 
