@@ -1,5 +1,12 @@
 import cv2, numpy as np, argparse, time, csv
 from scipy.spatial.distance import cdist
+from collections import namedtuple
+try:
+    from sklearn.cluster import DBSCAN
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    print("Warning: sklearn not available. Using simple connected-components clustering.")
 
 def args():
     p = argparse.ArgumentParser()
@@ -20,6 +27,9 @@ def args():
     p.add_argument("--reseed_ratio", type=float, default=0.3, help="fraction of features to reseed when low")
     p.add_argument("--of_winSize", type=int, default=31, help="optical flow window size (larger for big deformations)")
     p.add_argument("--of_maxLevel", type=int, default=4, help="optical flow pyramid levels")
+    p.add_argument("--deform_k_mad", type=float, default=2.0, help="MAD multiplier for deformation threshold (lower=more sensitive)")
+    p.add_argument("--deform_min_cluster", type=int, default=3, help="minimum points per deformation cluster")
+    p.add_argument("--deform_eps", type=float, default=20.0, help="DBSCAN eps in pixels for clustering")
     return p.parse_args()
 def robust_normalize(arr, eps=1e-6):
     """Normalize by robust max (median + 3*MAD)."""
@@ -179,43 +189,238 @@ def mean_abs_edge_strain(Xref, Xnow, k=4):
     keep = np.abs(eps-m) < 3*1.4826*mad
     return float(np.mean(eps[keep]))
 
+# Region data structure for deformation patches
+Region = namedtuple('Region', ['bbox', 'indices', 'mean_disp', 'max_disp', 'n_points'])
+
+def detect_deformation_regions(Xnow, Xref_original, u_mag, roi, params=None):
+    """
+    Heuristic detection of deformation regions from feature displacements.
+    
+    This function can be replaced by an ML-based detector in the future.
+    
+    Args:
+        Xnow: (N, 2) current feature positions
+        Xref_original: (N, 2) baseline feature positions (must match Xnow indices)
+        u_mag: (N,) displacement magnitudes
+        roi: (x, y, w, h) ROI bounds
+        params: dict with optional parameters:
+            - k_mad: multiplier for MAD threshold (default 2.5)
+            - min_cluster_size: minimum points per cluster (default 3)
+            - eps_px: DBSCAN eps in pixels (default 20)
+    
+    Returns:
+        list[Region]: detected deformation regions
+    """
+    if params is None:
+        params = {}
+    k_mad = params.get('k_mad', 2.5)
+    min_cluster_size = params.get('min_cluster_size', 3)
+    eps_px = params.get('eps_px', 20.0)
+    
+    if len(Xnow) == 0 or len(u_mag) == 0:
+        return []
+    
+    # Step 1: Robust thresholding
+    m = np.median(u_mag)
+    mad = np.median(np.abs(u_mag - m)) + 1e-6
+    threshold = m + k_mad * 1.4826 * mad  # MAD scaling factor
+    
+    strong_mask = u_mag > threshold
+    if not np.any(strong_mask):
+        return []
+    
+    X_strong = Xnow[strong_mask]
+    u_strong = u_mag[strong_mask]
+    strong_indices = np.where(strong_mask)[0]
+    
+    # Step 2: Clustering
+    # Compute image bounds for bounding box clipping
+    x, y, w, h = roi
+    img_h = max(int(np.max(X_strong[:, 1])) + 10, y + h) if len(X_strong) > 0 else y + h
+    img_w = max(int(np.max(X_strong[:, 0])) + 10, x + w) if len(X_strong) > 0 else x + w
+    
+    if HAS_SKLEARN and len(X_strong) >= min_cluster_size:
+        # Use DBSCAN
+        clustering = DBSCAN(eps=eps_px, min_samples=min_cluster_size).fit(X_strong)
+        labels = clustering.labels_
+    else:
+        # Fallback: simple connected components in image space
+        # Create a binary image and use cv2.connectedComponents
+        # Use full eps_px as radius to ensure connectivity
+        binary = np.zeros((img_h, img_w), dtype=np.uint8)
+        
+        for pt in X_strong:
+            px, py = int(pt[0]), int(pt[1])
+            if 0 <= px < img_w and 0 <= py < img_h:
+                cv2.circle(binary, (px, py), int(eps_px), 255, -1)  # Use full eps_px as radius
+        
+        num_labels, labels_img = cv2.connectedComponents(binary)
+        labels = np.zeros(len(X_strong), dtype=int) - 1
+        
+        for i, pt in enumerate(X_strong):
+            px, py = int(pt[0]), int(pt[1])
+            if 0 <= px < img_w and 0 <= py < img_h:
+                labels[i] = labels_img[py, px] - 1  # -1 because 0 is background
+    
+    # Step 3: Extract regions
+    regions = []
+    unique_labels = set(labels)
+    unique_labels.discard(-1)  # Remove noise label
+    
+    for label in unique_labels:
+        cluster_mask = labels == label
+        cluster_points = X_strong[cluster_mask]
+        cluster_disp = u_strong[cluster_mask]
+        cluster_indices = strong_indices[cluster_mask]
+        
+        if len(cluster_points) < min_cluster_size:
+            continue
+        
+        # Compute bounding box
+        x_min = int(np.min(cluster_points[:, 0]))
+        y_min = int(np.min(cluster_points[:, 1]))
+        x_max = int(np.max(cluster_points[:, 0]))
+        y_max = int(np.max(cluster_points[:, 1]))
+        
+        # Add small padding
+        padding = 5
+        x_min = max(0, x_min - padding)
+        y_min = max(0, y_min - padding)
+        x_max = min(img_w, x_max + padding)
+        y_max = min(img_h, y_max + padding)
+        
+        bbox = (x_min, y_min, x_max, y_max)
+        mean_disp = float(np.mean(cluster_disp))
+        max_disp = float(np.max(cluster_disp))
+        
+        regions.append(Region(
+            bbox=bbox,
+            indices=cluster_indices,
+            mean_disp=mean_disp,
+            max_disp=max_disp,
+            n_points=len(cluster_points)
+        ))
+    
+    return regions
+
+def find_available_cameras(max_test=5):
+    """Test camera indices to find available cameras."""
+    available = []
+    for i in range(max_test):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                available.append(i)
+            cap.release()
+    return available
+
 def main():
     a = args()
     cap = cv2.VideoCapture(a.cam)  # Use default backend (cross-platform)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, a.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, a.height)
-    if not cap.isOpened(): raise RuntimeError("Camera not opened")
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open camera {a.cam}")
+        print("\nSearching for available cameras...")
+        available = find_available_cameras()
+        if available:
+            print(f"✓ Found {len(available)} available camera(s): {available}")
+            print(f"\nTry running with one of these:")
+            for cam_idx in available:
+                print(f"  python optical_flow.py --cam {cam_idx}")
+        else:
+            print("✗ No cameras found. Please check:")
+            print("  - Camera is connected")
+            print("  - Camera permissions (try: sudo chmod 666 /dev/video*)")
+            print("  - No other program is using the camera")
+        cap.release()
+        raise RuntimeError(f"Camera {a.cam} not opened")
 
     ret, frame = cap.read(); 
-    if not ret: raise RuntimeError("No frame")
+    if not ret:
+        cap.release()
+        raise RuntimeError(f"Could not read frame from camera {a.cam}")
     gray0 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray0 = clahe(gray0)
     H,W = gray0.shape
 
+    # ROI selection with better handling
     if a.interactive_roi:
-        r = cv2.selectROI("Select ROI (ENTER)", frame, False, True); cv2.destroyAllWindows()
-        x,y,w,h = [int(v) for v in r]
-        if w==0 or h==0: x,y,w,h = 0,0,W,H
+        print("\n" + "="*60)
+        print("ROI SELECTION INSTRUCTIONS:")
+        print("  1. Click and drag to select the region of interest")
+        print("  2. Press SPACE or ENTER to confirm")
+        print("  3. Press ESC or 'q' to cancel and use default ROI")
+        print("="*60 + "\n")
+        
+        # Create a copy with instructions overlay
+        frame_with_text = frame.copy()
+        cv2.putText(frame_with_text, "Drag to select ROI, then press SPACE/ENTER", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame_with_text, f"Frame size: {W}x{H} pixels", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # selectROI returns (x, y, w, h) when confirmed, or (0,0,0,0) if cancelled
+        # The third parameter (False) means don't show crosshair
+        # The fourth parameter (False) means don't center the box
+        r = cv2.selectROI("Select ROI - Drag rectangle, then press SPACE/ENTER", 
+                         frame_with_text, False, False)
+        
+        cv2.destroyAllWindows()
+        
+        # Check if valid ROI was selected
+        if r[2] > 0 and r[3] > 0:  # width and height > 0
+            x, y, w, h = [int(v) for v in r]
+            # Validate ROI is within frame bounds
+            x = max(0, min(x, W-1))
+            y = max(0, min(y, H-1))
+            w = max(10, min(w, W - x))  # Minimum 10 pixels width, ensure fits in frame
+            h = max(10, min(h, H - y))  # Minimum 10 pixels height, ensure fits in frame
+            print(f"✓ ROI selected: x={x}, y={y}, width={w}, height={h}")
+        else:
+            # User cancelled or selected invalid ROI
+            print("⚠ No valid ROI selected. Using default ROI (70% of frame)")
+            w = int(W*0.7); h = int(H*0.7); x = (W-w)//2; y = (H-h)//2
     else:
         w = int(W*0.7); h = int(H*0.7); x = (W-w)//2; y = (H-h)//2
+        print(f"Using default ROI: x={x}, y={y}, width={w}, height={h}")
+    
     roi = (x,y,w,h)
+    print(f"Final ROI: x={x}, y={y}, width={w}, height={h} (covers {100*w*h/(W*H):.1f}% of frame)\n")
 
     # seed reference points
     p0 = pick_grid_features(gray0, roi, tuple(a.cells), a.kpc, a.ql, a.minDist, useHarris=True)
     if p0 is None or len(p0)<50:
         raise RuntimeError("Not enough features. Improve texture/lighting.")
 
-    # reference positions (undeformed) - NEVER RESET THIS
+    # reference positions (undeformed baseline) - can be updated with 'b' key
     Xref_original = p0.reshape(-1,2).copy()
     Xref = Xref_original.copy()  # Working reference (may be updated for matching)
+    
+    # Track which current features correspond to baseline features
+    # This mapping is updated when baseline is reset or features are reseeded
+    baseline_feature_map = np.arange(len(p0))  # Initially, all features map to themselves
 
-    # CSV
+    # CSV for regular frames
     f = open(a.csv,"w",newline="",encoding="utf-8"); wr = csv.writer(f)
-    wr.writerow(["t_s","frame","n_features","S_edge_mean","U_med","F_hat"])
+    wr.writerow(["t_s","frame","n_features","S_edge_mean","U_med","F_hat","marked","n_clusters","cluster_stats"])
+    
+    # CSV for marked frames (max deformation)
+    csv_marked = a.csv.replace(".csv", "_marked.csv")
+    f_marked = open(csv_marked,"w",newline="",encoding="utf-8"); wr_marked = csv.writer(f_marked)
+    wr_marked.writerow(["t_s","frame","n_features","n_clusters","cluster_stats"])
+    
     t0 = time.time(); k=0
+    baseline_set = True  # True after initial seeding
 
     prev = gray0; Pprev = p0.reshape(-1,1,2).astype(np.float32)
     feature_confidence = np.ones(len(p0))  # Track confidence for each feature
+    
+    # State for max deformation frame
+    marked_regions = None
+    marked_frame_data = None
 
     while True:
         ret, frame = cap.read()
@@ -269,34 +474,125 @@ def main():
         X0 = Pkeep.reshape(-1,2); X1 = Pnow.reshape(-1,2)
         X0_in, X1_corr = remove_global_affine(X0, X1)
         
-        # Match current features to original reference frame
-        # For features that were in original reference, compute displacement from original
-        # For new features, use current position as reference
-        if len(X1_corr) > 0:
-            # Find nearest neighbors in original reference for each current feature
-            if len(Xref_original) > 0:
-                dists = cdist(X1_corr, Xref_original)
-                nearest_idx = np.argmin(dists, axis=1)
-                nearest_dists = dists[np.arange(len(X1_corr)), nearest_idx]
-                
-                # Use original reference for features close to original positions
-                # For new features far from original, use current as reference
-                use_original = nearest_dists < 20  # 20 pixel threshold
-                X0_ref = np.zeros_like(X1_corr)
-                X0_ref[use_original] = Xref_original[nearest_idx[use_original]]
-                X0_ref[~use_original] = X1_corr[~use_original]  # New features: self-reference
-            else:
-                X0_ref = X1_corr  # Fallback
+        # Match current features to baseline (Xref_original)
+        # Compute displacement U = Xnow - Xref_original for matched features
+        if len(X1_corr) > 0 and baseline_set and len(Xref_original) > 0:
+            # Find nearest neighbors in baseline for each current feature
+            dists = cdist(X1_corr, Xref_original)
+            nearest_idx = np.argmin(dists, axis=1)
+            nearest_dists = dists[np.arange(len(X1_corr)), nearest_idx]
+            
+            # Match threshold: features within threshold are considered matched to baseline
+            # Use adaptive threshold based on expected deformation scale
+            # For large deformations, we need a larger matching radius
+            match_threshold = max(30.0, np.percentile(nearest_dists, 75) * 1.5)  # Adaptive: 1.5x 75th percentile
+            matched_mask = nearest_dists < match_threshold
+            
+            # For matched features: U = Xnow - Xref_original
+            # For unmatched (new) features: U = 0 (no baseline displacement)
+            U = np.zeros_like(X1_corr)
+            if np.any(matched_mask):
+                U[matched_mask] = X1_corr[matched_mask] - Xref_original[nearest_idx[matched_mask]]
+            
+            # Store which baseline features are matched (for later use)
+            baseline_matched_indices = nearest_idx[matched_mask] if np.any(matched_mask) else np.array([], dtype=int)
         else:
-            X0_ref = X1_corr
-
-        # vectors U from reference → current
-        U = (X1_corr - X0_ref)    # Displacement vectors
-        # scalar deformation proxies
-        S = mean_abs_edge_strain(X0_ref, X1_corr, k=a.k_nn) if len(X0_ref) > a.k_nn else np.nan
-        U_med = float(np.median(np.linalg.norm(U,axis=1))) if len(U)>0 else 0.0
+            # No baseline set yet, or no features
+            U = np.zeros_like(X1_corr)
+            matched_mask = np.zeros(len(X1_corr), dtype=bool)
+            baseline_matched_indices = np.array([], dtype=int)
+        # scalar deformation proxies (using matched features for strain)
+        X0_ref_matched = Xref_original[baseline_matched_indices] if len(baseline_matched_indices) > 0 else X1_corr[matched_mask] if np.any(matched_mask) else X1_corr
+        X1_matched = X1_corr[matched_mask] if np.any(matched_mask) else X1_corr
+        S = mean_abs_edge_strain(X0_ref_matched, X1_matched, k=a.k_nn) if len(X0_ref_matched) > a.k_nn else np.nan
+        u_mag = np.linalg.norm(U, axis=1)  # Displacement magnitude
+        U_med = float(np.median(u_mag)) if len(u_mag)>0 else 0.0
         F_hat = a.a*S + a.b if not np.isnan(S) else 0.0
 
+        # Handle keyboard input (read at start of processing)
+        key = cv2.waitKey(1) & 0xFF
+        
+        # 'b' key: Set/update baseline
+        if key == ord('b'):
+            if len(X1_corr) > 0:
+                Xref_original = X1_corr.copy()
+                baseline_set = True
+                marked_regions = None  # Clear marked regions when baseline changes
+                print(f"[Frame {k}] Baseline updated with {len(X1_corr)} features")
+        
+        # 'm' key: Mark max deformation frame
+        if key == ord('m'):
+            if len(X1_corr) > 0 and baseline_set:
+                # Debug: Print displacement statistics
+                n_matched = np.sum(matched_mask) if 'matched_mask' in locals() else 0
+                u_mag_matched = u_mag[matched_mask] if np.any(matched_mask) else np.array([])
+                print(f"[Frame {k}] Displacement stats: n_features={len(X1_corr)}, n_matched={n_matched}")
+                if len(u_mag_matched) > 0:
+                    print(f"  u_mag: min={np.min(u_mag_matched):.2f}, median={np.median(u_mag_matched):.2f}, max={np.max(u_mag_matched):.2f}, mean={np.mean(u_mag_matched):.2f}")
+                else:
+                    print(f"  WARNING: No features matched to baseline! Check matching threshold.")
+                    print(f"  All u_mag: min={np.min(u_mag):.2f}, median={np.median(u_mag):.2f}, max={np.max(u_mag):.2f}")
+                
+                # Detect deformation regions
+                deform_params = {
+                    'k_mad': a.deform_k_mad,
+                    'min_cluster_size': a.deform_min_cluster,
+                    'eps_px': a.deform_eps
+                }
+                marked_regions = detect_deformation_regions(X1_corr, Xref_original, u_mag, roi, deform_params)
+                
+                # Debug: Print threshold info
+                if len(u_mag) > 0:
+                    m = np.median(u_mag)
+                    mad = np.median(np.abs(u_mag - m)) + 1e-6
+                    threshold = m + a.deform_k_mad * 1.4826 * mad
+                    n_above_thresh = np.sum(u_mag > threshold)
+                    print(f"  Threshold (median + {a.deform_k_mad}*MAD): {threshold:.2f}, features above: {n_above_thresh}")
+                    
+                    # Debug clustering
+                    if n_above_thresh > 0:
+                        X_strong_debug = X1_corr[u_mag > threshold]
+                        if len(X_strong_debug) > 1:
+                            # Compute pairwise distances using cdist (already imported)
+                            pairwise_dists_matrix = cdist(X_strong_debug, X_strong_debug)
+                            # Get upper triangle (avoid duplicates and diagonal)
+                            n_pts = len(X_strong_debug)
+                            pairwise_dists = pairwise_dists_matrix[np.triu_indices(n_pts, k=1)]
+                            print(f"  Clustering: eps={a.deform_eps}px, min_cluster={a.deform_min_cluster}")
+                            print(f"  Pairwise distances: min={np.min(pairwise_dists):.1f}, median={np.median(pairwise_dists):.1f}, max={np.max(pairwise_dists):.1f}")
+                            print(f"  Features within eps: {np.sum(pairwise_dists <= a.deform_eps)}/{len(pairwise_dists)} pairs")
+                
+                # Prepare cluster stats string
+                cluster_stats = []
+                for r in marked_regions:
+                    cluster_stats.append(f"d_mean={r.mean_disp:.2f},d_max={r.max_disp:.2f},n={r.n_points}")
+                cluster_stats_str = "|".join(cluster_stats) if cluster_stats else ""
+                
+                # Log to marked frames CSV
+                wr_marked.writerow([
+                    time.time() - t0,
+                    k,
+                    len(X1_corr),
+                    len(marked_regions),
+                    cluster_stats_str
+                ])
+                f_marked.flush()
+                
+                print(f"[Frame {k}] Marked max deformation: {len(marked_regions)} regions detected")
+                if len(marked_regions) == 0 and n_above_thresh > 0:
+                    print(f"  Tip: Features above threshold but not clustering. Try:")
+                    print(f"    - Increase --deform_eps (current: {a.deform_eps}) to group distant features")
+                    print(f"    - Decrease --deform_min_cluster (current: {a.deform_min_cluster}) to allow smaller clusters")
+                    print(f"    - Or lower --deform_k_mad (current: {a.deform_k_mad}) to get more features")
+                elif len(marked_regions) == 0:
+                    print(f"  Tip: Try lowering --deform_k_mad (current: {a.deform_k_mad}) to detect smaller deformations")
+                marked_frame_data = {
+                    'regions': marked_regions,
+                    'X1_corr': X1_corr.copy(),
+                    'u_mag': u_mag.copy(),
+                    'frame': frame.copy()
+                }
+        
         # draw
         disp = frame.copy()
         cv2.rectangle(disp, (x,y), (x+w,y+h), (0,255,0), 1)
@@ -315,12 +611,32 @@ def main():
             cv2.arrowedLine(disp, tuple(X), tip, color, 1, tipLength=0.3)
             cv2.circle(disp, tuple(X), 2, color, -1)
         
-        txt = f"N:{len(X1_corr)}  S:{S:.4f}  |U|med:{U_med:.3f}  F̂:{F_hat:.2f}  Conf:{np.mean(feature_confidence):.2f}"
-        cv2.putText(disp, txt, (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,(255,255,255),2,cv2.LINE_AA)
-        cv2.imshow("vector-lines", disp)
+        # Draw bounding boxes for marked regions (or current frame if 'm' was just pressed)
+        regions_to_draw = marked_regions if marked_regions is not None else []
+        if key == ord('m') and marked_regions is not None:
+            regions_to_draw = marked_regions
         
-        # vectors from reference to current for heatmap
-        u_mag = np.linalg.norm(U, axis=1)          # (M,)
+        for r in regions_to_draw:
+            x_min, y_min, x_max, y_max = r.bbox
+            # Draw bounding box in green
+            cv2.rectangle(disp, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            # Draw label with stats
+            label = f"d_mean={r.mean_disp:.1f}px, d_max={r.max_disp:.1f}px, n={r.n_points}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_y = max(y_min - 5, label_size[1] + 5)
+            cv2.rectangle(disp, (x_min, label_y - label_size[1] - 5), 
+                         (x_min + label_size[0] + 5, label_y + 5), (0, 255, 0), -1)
+            cv2.putText(disp, label, (x_min + 2, label_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        
+        # Status text
+        baseline_status = "BASELINE SET" if baseline_set else "NO BASELINE (press 'b')"
+        marked_status = f" | MARKED: {len(marked_regions)} regions" if marked_regions is not None else ""
+        txt = f"N:{len(X1_corr)}  S:{S:.4f}  |U|med:{U_med:.3f}  F̂:{F_hat:.2f}  {baseline_status}{marked_status}"
+        cv2.putText(disp, txt, (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,(255,255,255),2,cv2.LINE_AA)
+        cv2.putText(disp, "Press 'b'=baseline, 'm'=mark max deformation, 'q'=quit", 
+                   (10, disp.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+        cv2.imshow("vector-lines", disp)
 
         # --- build a separate deformation heatmap window ---
         heat_bgr = make_disp_heatmap(
@@ -330,19 +646,36 @@ def main():
             roi,
             sigma_px=15         # adjust smoothness (10–20 works well)
         )
+        
+        # Overlay bounding boxes on heatmap if regions are marked
+        if regions_to_draw:
+            for r in regions_to_draw:
+                x_min, y_min, x_max, y_max = r.bbox
+                cv2.rectangle(heat_bgr, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
 
         cv2.imshow("deform-heat", heat_bgr)
 
-        # log
-        wr.writerow([time.time()-t0, k, int(len(X1_corr)), S, U_med, F_hat])
+        # log regular frame
+        cluster_stats_str = ""
+        n_clusters = 0
+        if marked_regions is not None:
+            n_clusters = len(marked_regions)
+            cluster_stats = [f"d_mean={r.mean_disp:.2f},d_max={r.max_disp:.2f},n={r.n_points}" 
+                           for r in marked_regions]
+            cluster_stats_str = "|".join(cluster_stats)
+        
+        wr.writerow([time.time()-t0, k, int(len(X1_corr)), S, U_med, F_hat, 
+                    "marked" if key == ord('m') else "", n_clusters, cluster_stats_str])
+        f.flush()
 
         prev = gray
         Pprev = Pnow.copy()
         k += 1
-        key = cv2.waitKey(1) & 0xFF
+        
         if key in (27, ord('q')): break
 
     f.close()
+    f_marked.close()
     cap.release(); cv2.destroyAllWindows()
 
 if __name__ == "__main__":
